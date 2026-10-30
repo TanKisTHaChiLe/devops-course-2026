@@ -270,3 +270,103 @@ echo $?
 
 Ожидается код 0. В отчёт включаются текст раздела 8 и результаты трёх
 сценариев: исправная конфигурация, нарушение условия в), нарушение условия г).
+
+## 9. Контейнеризация
+
+Docker Engine Community установлен внутри Ubuntu ARM64 из официального APT-репозитория
+`https://download.docker.com/linux/ubuntu`, ветка `noble stable`, с ключом
+`/etc/apt/keyrings/docker.asc`. Источник описан в `/etc/apt/sources.list.d/docker.sources`.
+Пакеты: `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`,
+`docker-compose-plugin`. Пакет Ubuntu `docker.io` не используется.
+Зафиксированные версии: Docker Engine 29.9.2, Compose v5.6.1.
+
+```bash
+sudo apt update
+sudo apt install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod 644 /etc/apt/keyrings/docker.asc
+sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker devops
+```
+
+После добавления в группу открыть новое SSH-соединение. Пользователь группы docker -
+`devops`, уже имеющий sudo. Доступ к Docker фактически даёт полномочия root на Ubuntu.
+
+Исходники хранятся в `app/` репозитория; рабочий проект на сервере - `/home/devops/app`.
+Образ `devops-app:1.0` основан на `python:3.12-slim`, приложение запускается от `app`
+(UID 999), а не root. Зависимости устанавливаются до копирования app.py для использования кэша.
+
+Доставка с Mac (сначала проверить план):
+
+```bash
+rsync -avz --delete --exclude=.env --dry-run app/ devops:app/
+rsync -avz --delete --exclude=.env app/ devops:app/
+```
+
+Настройки находятся только на сервере в `/home/devops/app/.env`, владелец `devops:devops`,
+права 600. Переменные: `POSTGRES_DB=app`, `POSTGRES_USER=app`, `DB_HOST=db` и случайный
+`POSTGRES_PASSWORD`. В Git хранится лишь `.env.example` с заглушкой. `.env` исключён
+из Git, контекста Docker и rsync. При первом развёртывании сгенерировать пароль на сервере:
+
+```bash
+cd ~/app
+# Только если .env ещё не существует; не менять пароль существующей базы этим способом.
+if [ ! -e .env ]; then
+    (umask 077; cp .env.example .env)
+    chmod 600 .env
+    sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+fi
+docker compose up -d --build --wait
+```
+
+Compose-файл: `app/docker-compose.yml`. Проект `app` содержит сервисы `app` и `db`,
+контейнеры `app-app-1` и `app-db-1`. База использует `postgres:16-alpine` и healthcheck
+`pg_isready`; приложение стартует после `service_healthy`.
+Общая bridge-сеть - `app_backend`: встроенный DNS разрешает имя сервиса `db`.
+
+Публикация приложения: `127.0.0.1:5000:5000`. PostgreSQL не публикует порт 5432
+на Ubuntu. Запись `5432/tcp` в docker compose ps обозначает внутренний порт, а не публикацию.
+Именованный том `app_db_data` смонтирован в `/var/lib/postgresql/data` контейнера db.
+`docker compose down` сохраняет данные; `docker compose down -v` удаляет том и базу.
+Последняя команда использовалась только для учебного опыта со сбросом счётчика.
+
+В HTTPS-блок `/etc/nginx/sites-available/devops-site` добавлено:
+
+```nginx
+location /app/ {
+    proxy_pass http://127.0.0.1:5000/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+Статический `location /` сохранён. Применение: `sudo nginx -t && sudo systemctl reload nginx`.
+Префикс `/app/` заменяется на `/` перед передачей в контейнер; `/app/health` становится `/health`.
+Проверки с Mac используют `curl -4 --cacert certs/devops.crt` для URL
+`https://devops.local/app/`, `https://devops.local/app/health` и `https://devops.local/`.
+
+При остановленном app Nginx возвращает 502, в журнале
+`/var/log/nginx/devops-site.error.log` появляется `connect() failed (111: Connection refused)`.
+Восстановление: `cd ~/app && docker compose start app`.
+Тестовый контейнер `exposed` с публикацией 5001 был остановлен и автоматически удалён.
+
+Раздел `[5] Контейнеризация` в `scripts/audit.sh` проверяет активность Docker, healthy базы,
+отсутствие публикации 5000/5432 вне 127.0.0.1 и права .env 600.
+Запуск внутри Ubuntu: `bash ~/scripts/audit.sh; echo $?`.
+После добавления проверок ожидается 14 успешных проверок и код 0.
+Для отрицательной проверки в) временно заменить публикацию в серверном Compose-файле
+на `5000:5000`, пересоздать app и запустить аудит: ожидается код 1.
+Сразу вернуть `127.0.0.1:5000:5000`, пересоздать app и повторить аудит: ожидается код 0.

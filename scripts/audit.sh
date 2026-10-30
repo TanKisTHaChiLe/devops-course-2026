@@ -80,5 +80,25 @@ if [[ "$KEY_MODE" != 600 ]]; then
 fi
 check 'Нет записи для всех в каталоге сайта; права ключа 600' 'yes' "$PERMISSIONS_OK"
 
+echo '[5] Контейнеризация'
+DOCKER_STATE="$(systemctl is-active docker 2>/dev/null)" || :
+check 'Служба docker активна' 'active' "$DOCKER_STATE"
+DB_HEALTH="$(as_root docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null)" || DB_HEALTH='недоступен'
+check 'Контейнер PostgreSQL healthy' 'healthy' "$DB_HEALTH"
+
+PORTS_SAFE=yes
+if LISTENERS="$(ss -H -tln)"; then
+    UNSAFE_LISTENERS="$(awk '$4 ~ /:(5000|5432)$/ && $4 !~ /^127\.0\.0\.1:(5000|5432)$/ {print $4}' <<< "$LISTENERS")"
+    if [[ -n "$UNSAFE_LISTENERS" ]]; then
+        printf ' Недопустимые адреса публикации:\n%s\n' "$UNSAFE_LISTENERS"
+        PORTS_SAFE=no
+    fi
+else
+    PORTS_SAFE=no
+fi
+check 'Порты 5000/5432 не открыты вне 127.0.0.1' 'yes' "$PORTS_SAFE"
+ENV_MODE="$(as_root stat -c '%a' /home/devops/app/.env 2>/dev/null)" || ENV_MODE='недоступен'
+check 'Права /home/devops/app/.env равны 600' '600' "$ENV_MODE"
+
 printf 'Пройдено: %s, не пройдено: %s\n' "$PASS" "$FAIL"
 if (( FAIL == 0 )); then exit 0; else exit 1; fi
